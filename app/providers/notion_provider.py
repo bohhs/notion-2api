@@ -26,7 +26,8 @@ class _IncrementalCleaner:
 
     SUPPRESSED_TAGS = frozenset({
         'thinking', 'thought', 'reflection',
-        'internal_monologue', 'reasoning', 'analysis', 'scratchpad'
+        'internal_monologue', 'reasoning', 'analysis', 'scratchpad',
+        'inner_monologue', 'meta', 'plan', 'internal', 'response_planning',
     })
 
     def __init__(self):
@@ -182,7 +183,7 @@ class NotionAIProvider(BaseProvider):
                 yield create_sse_data(role_chunk)
 
                 cleaner = _IncrementalCleaner()
-                PREFIX_MAX = 2000
+                PREFIX_MAX = 8000
                 prefix_parts: List[str] = []
                 prefix_len = 0
                 prefix_flushed = False
@@ -269,6 +270,9 @@ class NotionAIProvider(BaseProvider):
                             yield create_sse_data(chunk)
                         else:
                             fallback = re.sub(r'<(thinking|thought|reflection|reasoning|analysis|scratchpad|internal_monologue)>[\s\S]*?</\1>', '', text, flags=re.IGNORECASE).strip()
+                            fallback = self._extract_after_eq_delimiter(fallback)
+                            fallback = self._strip_leading_reasoning(fallback)
+                            fallback = fallback.strip()
                             if fallback:
                                 chunk = create_chat_completion_chunk(request_id, model_name, content=fallback)
                                 yield create_sse_data(chunk)
@@ -413,30 +417,127 @@ class NotionAIProvider(BaseProvider):
         
         return payload
 
+    def _extract_after_eq_delimiter(self, content: str) -> str:
+        """处理 ="[语言代码] 分隔符，提取分隔符后的实际回复内容。
+        模型有时会输出: [推理文本]="zh-[实际回复] 或 [推理文本]="[实际回复]
+        """
+        match = re.search(r'="(?:[a-z]{2}(?:-[a-zA-Z]{2,8})?)?[-\s]*(?=\S)', content)
+        if not match:
+            return content
+
+        before = content[:match.start()]
+        after = content[match.end():].strip()
+
+        if len(before) < 50 or len(after) < 2:
+            return content
+
+        lower = before.lower()
+        indicators = [
+            'user', 'message', 'should', 'respond', 'context',
+            'chinese', 'incomplete', 'unclear', 'search', 'reply',
+            'appears', 'looking', 'according', 'instructions',
+            'need to', "i should", "i don't", 'this is',
+            'the character', 'conversation', 'timezone',
+            'acknowledge', 'clarification', 'brief', 'i\'ll',
+            'given the', 'based on', 'since ',
+        ]
+        if sum(1 for ind in indicators if ind in lower) >= 2:
+            return after
+
+        return content
+
+    def _strip_leading_reasoning(self, content: str) -> str:
+        """去除开头的英文推理文本块，只保留实际回复内容。"""
+        if not content:
+            return content
+
+        first_non_space = content.lstrip()
+        if first_non_space and '\u4e00' <= first_non_space[0] <= '\u9fff':
+            return content
+
+        lower_start = content[:500].lower().strip()
+        reasoning_starters = [
+            'user\'s message', 'the user', 'user message', 'users message',
+            'looking at', 'given the context', 'given that',
+            'this is a', 'this appears', 'this seems', 'this is very',
+            'the message', 'the character', 'the word', 'the text',
+            'i should', 'i need to', 'i will', 'i don\'t', 'i\'ll',
+            'let me', 'according to', 'based on',
+            'since this', 'since the', 'since we',
+            'sent "', 'sent \'', 'sent \u201c',
+        ]
+
+        starts_with_reasoning = False
+        for starter in reasoning_starters:
+            if lower_start.startswith(starter):
+                starts_with_reasoning = True
+                break
+
+        if not starts_with_reasoning and re.match(r'^["\u201c\u300c\u2018]', lower_start):
+            starts_with_reasoning = True
+
+        if not starts_with_reasoning:
+            return content
+
+        lines = content.split('\n')
+        total_reasoning_chars = 0
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            chinese_chars = sum(1 for c in stripped if '\u4e00' <= c <= '\u9fff')
+            total_chars = max(len(stripped), 1)
+
+            if chinese_chars > 3 and chinese_chars / total_chars > 0.3 and total_reasoning_chars > 80:
+                return '\n'.join(lines[i:]).strip()
+
+            if chinese_chars / total_chars < 0.3:
+                total_reasoning_chars += len(stripped)
+
+        return content
+
     def _clean_content(self, content: str) -> str:
+        """清洗模型输出，移除推理过程、思考标签等，只保留实际回复内容。"""
         if not content:
             return ""
 
         content = re.sub(r'<lang\s+primary="[^"]*"\s*/>\n*', '', content)
-        content = re.sub(r'<thinking>[\s\S]*?</thinking>\s*', '', content, flags=re.IGNORECASE)
-        content = re.sub(r'<thought>[\s\S]*?</thought>\s*', '', content, flags=re.IGNORECASE)
-        content = re.sub(r'<reflection>[\s\S]*?</reflection>\s*', '', content, flags=re.IGNORECASE)
-        content = re.sub(r'<internal_monologue>[\s\S]*?</internal_monologue>\s*', '', content, flags=re.IGNORECASE)
-        content = re.sub(r'<reasoning>[\s\S]*?</reasoning>\s*', '', content, flags=re.IGNORECASE)
-        content = re.sub(r'<analysis>[\s\S]*?</analysis>\s*', '', content, flags=re.IGNORECASE)
-        content = re.sub(r'<scratchpad>[\s\S]*?</scratchpad>\s*', '', content, flags=re.IGNORECASE)
+
+        for tag in ['thinking', 'thought', 'reflection', 'internal_monologue',
+                    'reasoning', 'analysis', 'scratchpad', 'inner_monologue',
+                    'meta', 'plan', 'internal', 'response_planning']:
+            content = re.sub(rf'<{tag}(?:\s[^>]*)?>[\s\S]*?</{tag}>\s*', '', content, flags=re.IGNORECASE)
+
+        content = self._extract_after_eq_delimiter(content)
+
+        content = self._strip_leading_reasoning(content)
 
         reasoning_patterns = [
-            r'(?:The\s+)?user\s+(?:has\s+)?(?:asked|is\s+asking|wants)\s+.*?(?:in\s+Chinese|Chinese\s+response).*?\.\s*',
-            r'(?:I\s+)?(?:should|need\s+to|will|must)\s+(?:respond|reply|answer)\s+(?:in\s+)?Chinese.*?\.\s*',
-            r'(?:Since|Because)\s+.*?(?:asked\s+in\s+Chinese|Chinese.*?request|requested.*?Chinese).*?\.\s*',
-            r'This\s+is\s+a\s+(?:straightforward|simple|basic)\s+(?:question|query)\s+about\s+(?:my\s+identity|what\s+(?:model|AI)).*?\.\s*',
-            r'I\s+(?:don\'t|do\s+not)\s+need\s+to\s+use\s+any\s+tools?\s+.*?\.\s*',
-            r'(?:I\s+)?should\s+identify\s+myself\s+as\s+.*?\.\s*',
-            r'(?:I\s+)?should\s+not\s+(?:make|reveal)\s+.*?(?:model|architecture|underlying).*?\.\s*',
-            r'(?:This|It)\s+(?:is|requires)\s+.*?(?:identity|informational).*?(?:response|answer).*?\.\s*',
-            r'(?:Let\s+me\s+)?respond\s+(?:directly\s+)?(?:to\s+the\s+user\s+)?in\s+Chinese.*?\.\s*',
-            r'What\s+model\s+(?:am\s+I|are\s+you).*?(?:Chinese|reply).*?\.\s*',
+            r'(?:The\s+)?user[\'\'"]?s?\s+message\s+(?:is|was|says?|reads?)\s+[^\n]*\.\s*',
+            r'(?:The\s+)?user\s+(?:has\s+)?(?:asked|is\s+asking|wants|sent|said)\s+[^\n]*\.\s*',
+            r'(?:I\s+)?(?:should|need\s+to|will|must)\s+(?:respond|reply|answer|acknowledge)[^\n]*\.\s*',
+            r'(?:Since|Because|As)\s+[^\n]*?(?:Chinese|request|message|query|question)[^\n]*\.\s*',
+            r'This\s+is\s+(?:a\s+)?(?:straightforward|simple|basic|very\s+brief|unclear|minimal|incomplete|short)[^\n]*\.\s*',
+            r'I\s+(?:don\'t|do\s+not)\s+need\s+to\s+(?:use|search|look)[^\n]*\.\s*',
+            r'(?:I\s+)?should\s+(?:identify|not\s+make|not\s+reveal|just|probably|NOT)[^\n]*\.\s*',
+            r'(?:This|It)\s+(?:is|requires|appears|seems|looks|could)[^\n]*?(?:response|answer|reply|message)[^\n]*\.\s*',
+            r'(?:Let\s+me\s+)?respond\s+(?:directly\s+)?(?:to\s+)?[^\n]*\.\s*',
+            r'(?:The|Their|Its|His|Her)\s+(?:name|timezone|current|previous|message|language)[^\n]*\n',
+            r'(?:Given|Looking\s+at)\s+(?:the\s+)?(?:context|conversation|history)[^\n]*:?\s*\n',
+            r'According\s+to\s+(?:my\s+)?(?:instructions|guidelines|rules)[^\n]*\.\s*',
+            r'(?:An?\s+)?(?:incomplete|unclear|brief|minimal|ambiguous)\s+message\s*\n?',
+            r'A\s+typo\s*\n?',
+            r'Testing\s+if\s+[^\n]*\n?',
+            r'The\s+beginning\s+of\s+[^\n]*\n?',
+            r'(?:First|Second|Third|Fourth)\s+message:?\s+[^\n]*\n',
+            r'The\s+(?:character|word|phrase|text)\s+["\u201c][^\n]*\.\s*',
+            r'(?:I\s+)?(?:responded|asked|told|said|replied)\s+(?:in\s+)?(?:Chinese)?[^\n]*\n',
+            r'The\s+system\s+also\s+called\s+[^\n]*\n',
+            r'I\'m\s+not\s+sure\s+why\s+[^\n]*\n',
+            r'(?:They|He|She)\s+(?:could|might|may)\s+be\s+[^\n]*\n?',
+            r'(?:They\'re|He\'s|She\'s)\s+(?:saying|asking|testing|checking)[^\n]*\n?',
         ]
 
         for pattern in reasoning_patterns:
