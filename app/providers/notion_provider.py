@@ -63,7 +63,7 @@ class _IncrementalCleaner:
                 earliest_match = None
                 earliest_tag = ""
                 for tag in self.SUPPRESSED_TAGS:
-                    m = re.search(f'<{tag}>', self._buffer, re.IGNORECASE)
+                    m = re.search(rf'<{tag}(?:\s[^>]*)?>',  self._buffer, re.IGNORECASE)
                     if m and (earliest_match is None or m.start() < earliest_match.start()):
                         earliest_match = m
                         earliest_tag = tag
@@ -302,7 +302,69 @@ class NotionAIProvider(BaseProvider):
             }
             return StreamingResponse(stream_generator(), media_type="text/event-stream", headers=headers)
         else:
-            raise HTTPException(status_code=400, detail="此端点当前仅支持流式响应 (stream=true)。")
+            request_id = f"chatcmpl-{uuid.uuid4()}"
+            model_name = request_data.get("model", settings.DEFAULT_MODEL)
+            try:
+                content = await self._collect_response_text(request_data)
+                response_data = {
+                    "id": request_id,
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0
+                    }
+                }
+                return JSONResponse(content=response_data)
+            except Exception as e:
+                error_message = f"处理非流式请求时发生错误: {str(e)}"
+                logger.error(error_message, exc_info=True)
+                raise HTTPException(status_code=500, detail=error_message)
+
+    async def _collect_response_text(self, request_data: Dict[str, Any]) -> str:
+        """非流式模式：调用 Notion API，收集完整响应并清洗后返回。"""
+        model_name = request_data.get("model", settings.DEFAULT_MODEL)
+        mapped_model = settings.MODEL_MAP.get(model_name, "anthropic-sonnet-alt")
+        thread_type = "markdown-chat" if mapped_model.startswith("vertex-") else "workflow"
+
+        request_scraper = self._create_request_scraper()
+        thread_id = await self._create_thread(thread_type, scraper=request_scraper)
+        payload = self._prepare_payload(request_data, thread_id, mapped_model, thread_type)
+        headers = self._prepare_headers()
+
+        def _sync_collect():
+            all_parts = []
+            final_message = None
+
+            logger.info(f"[非流式] 请求 Notion AI URL: {self.api_endpoints['runInference']}")
+            response = request_scraper.post(
+                self.api_endpoints['runInference'],
+                headers=headers, json=payload, stream=True,
+                timeout=settings.API_REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                parsed = self._parse_ndjson_line_to_texts(line)
+                for text_type, content in parsed:
+                    if text_type == 'incremental':
+                        all_parts.append(content)
+                    elif text_type == 'final':
+                        final_message = content
+
+            text = "".join(all_parts) if all_parts else (final_message or "")
+            return self._clean_content(text) if text else ""
+
+        return await run_in_threadpool(_sync_collect)
 
     def _prepare_headers(self) -> Dict[str, str]:
         cookie_source = (settings.NOTION_COOKIE or "").strip()
@@ -420,44 +482,45 @@ class NotionAIProvider(BaseProvider):
     def _extract_after_eq_delimiter(self, content: str) -> str:
         """处理 ="[语言代码] 分隔符，提取分隔符后的实际回复内容。
         模型有时会输出: [推理文本]="zh-[实际回复] 或 [推理文本]="[实际回复]
+        仅当分隔符后紧跟中文字符时才提取，避免误匹配 ="internal" 等。
         """
-        match = re.search(r'="(?:[a-z]{2}(?:-[a-zA-Z]{2,8})?)?[-\s]*(?=\S)', content)
+        match = re.search(r'="(?:[a-z]{2}(?:-[a-zA-Z]{2,8})?)?[-\s]*(?=[\u4e00-\u9fff])', content)
         if not match:
             return content
 
         before = content[:match.start()]
         after = content[match.end():].strip()
 
-        if len(before) < 50 or len(after) < 2:
+        if len(before) < 30 or len(after) < 2:
             return content
 
-        lower = before.lower()
-        indicators = [
-            'user', 'message', 'should', 'respond', 'context',
-            'chinese', 'incomplete', 'unclear', 'search', 'reply',
-            'appears', 'looking', 'according', 'instructions',
-            'need to', "i should", "i don't", 'this is',
-            'the character', 'conversation', 'timezone',
-            'acknowledge', 'clarification', 'brief', 'i\'ll',
-            'given the', 'based on', 'since ',
-        ]
-        if sum(1 for ind in indicators if ind in lower) >= 2:
-            return after
-
-        return content
+        return after
 
     def _strip_leading_reasoning(self, content: str) -> str:
-        """去除开头的英文推理文本块，只保留实际回复内容。"""
+        """去除开头的英文推理文本块，只保留实际回复内容。
+        也处理中文用户消息回显后跟英文推理的情况，如:
+        '今天发生了什么" which means "What happened today?" in Chinese...'
+        """
         if not content:
             return content
 
         first_non_space = content.lstrip()
+
         if first_non_space and '\u4e00' <= first_non_space[0] <= '\u9fff':
-            return content
+            has_echo_pattern = re.search(
+                r'[\u4e00-\u9fff]["\u201d\u300d]?\s*'
+                r'(?:which\s+|that\s+|this\s+|means?\s|just\s+means|'
+                r'in\s+Chinese|in\s+English|is\s+a\s+|'
+                r'translates?\s|literally\s)',
+                content[:300], re.IGNORECASE
+            )
+            if not has_echo_pattern:
+                return content
 
         lower_start = content[:500].lower().strip()
         reasoning_starters = [
             'user\'s message', 'the user', 'user message', 'users message',
+            'user has sent', 'user sent', 'user asked', 'user said',
             'looking at', 'given the context', 'given that',
             'this is a', 'this appears', 'this seems', 'this is very',
             'the message', 'the character', 'the word', 'the text',
@@ -477,7 +540,11 @@ class NotionAIProvider(BaseProvider):
             starts_with_reasoning = True
 
         if not starts_with_reasoning:
-            return content
+            if not re.search(
+                r'[\u4e00-\u9fff]["\u201d\u300d]?\s*(?:which|that|means|in\s+Chinese)',
+                content[:300], re.IGNORECASE
+            ):
+                return content
 
         lines = content.split('\n')
         total_reasoning_chars = 0
@@ -495,6 +562,10 @@ class NotionAIProvider(BaseProvider):
 
             if chinese_chars / total_chars < 0.3:
                 total_reasoning_chars += len(stripped)
+            else:
+                if i == 0 and re.search(r'["\u201d\u300d]\s*(?:which|that|means|in\s+Chinese)', stripped, re.IGNORECASE):
+                    total_reasoning_chars += len(stripped)
+                    continue
 
         return content
 
@@ -504,6 +575,8 @@ class NotionAIProvider(BaseProvider):
             return ""
 
         content = re.sub(r'<lang\s+primary="[^"]*"\s*/>\n*', '', content)
+        content = re.sub(r'<internal-search-results\s*/>\s*', '', content, flags=re.IGNORECASE)
+        content = re.sub(r'<internal-search-results>[\s\S]*?</internal-search-results>\s*', '', content, flags=re.IGNORECASE)
 
         for tag in ['thinking', 'thought', 'reflection', 'internal_monologue',
                     'reasoning', 'analysis', 'scratchpad', 'inner_monologue',
@@ -517,12 +590,12 @@ class NotionAIProvider(BaseProvider):
         reasoning_patterns = [
             r'(?:The\s+)?user[\'\'"]?s?\s+message\s+(?:is|was|says?|reads?)\s+[^\n]*\.\s*',
             r'(?:The\s+)?user\s+(?:has\s+)?(?:asked|is\s+asking|wants|sent|said)\s+[^\n]*\.\s*',
-            r'(?:I\s+)?(?:should|need\s+to|will|must)\s+(?:respond|reply|answer|acknowledge)[^\n]*\.\s*',
-            r'(?:Since|Because|As)\s+[^\n]*?(?:Chinese|request|message|query|question)[^\n]*\.\s*',
+            r'(?:I\s+)?(?:should|need\s+to|will|must)\s+(?:respond|reply|answer|acknowledge|search|query|output|use)[^\n]*\.\s*',
+            r'(?:Since|Because|As)\s+[^\n]*?(?:Chinese|request|message|query|question|greeting|simple)[^\n]*\.\s*',
             r'This\s+is\s+(?:a\s+)?(?:straightforward|simple|basic|very\s+brief|unclear|minimal|incomplete|short)[^\n]*\.\s*',
-            r'I\s+(?:don\'t|do\s+not)\s+need\s+to\s+(?:use|search|look)[^\n]*\.\s*',
-            r'(?:I\s+)?should\s+(?:identify|not\s+make|not\s+reveal|just|probably|NOT)[^\n]*\.\s*',
-            r'(?:This|It)\s+(?:is|requires|appears|seems|looks|could)[^\n]*?(?:response|answer|reply|message)[^\n]*\.\s*',
+            r'I\s+(?:don\'t|do\s+not)\s+need\s+to\s+(?:use|search|look|call)[^\n]*\.\s*',
+            r'(?:I\s+)?should\s+(?:identify|not\s+make|not\s+reveal|just|probably|NOT|respond|reply|search|query)[^\n]*\.\s*',
+            r'(?:This|It)\s+(?:is|requires|appears|seems|looks|could)[^\n]*?(?:response|answer|reply|message|greeting|question)[^\n]*\.\s*',
             r'(?:Let\s+me\s+)?respond\s+(?:directly\s+)?(?:to\s+)?[^\n]*\.\s*',
             r'(?:The|Their|Its|His|Her)\s+(?:name|timezone|current|previous|message|language)[^\n]*\n',
             r'(?:Given|Looking\s+at)\s+(?:the\s+)?(?:context|conversation|history)[^\n]*:?\s*\n',
@@ -538,21 +611,38 @@ class NotionAIProvider(BaseProvider):
             r'I\'m\s+not\s+sure\s+why\s+[^\n]*\n',
             r'(?:They|He|She)\s+(?:could|might|may)\s+be\s+[^\n]*\n?',
             r'(?:They\'re|He\'s|She\'s)\s+(?:saying|asking|testing|checking)[^\n]*\n?',
+            r'["\u201c][^\n]{1,50}["\u201d]\s+(?:which|that|this)\s+(?:means?|is|just)[^\n]*\.\s*',
+            r'(?:Events|Meetings|Updates|Changes|General)\s+(?:in|or|today|news)[^\n]*\n?',
+            r'(?:I\s+)?(?:can|could)\s+just\s+respond[^\n]*\.\s*',
+            r'(?:I\s+)?need\s+to\s+output\s+a\s+language\s+tag[^\n]*\.\s*',
         ]
 
         for pattern in reasoning_patterns:
             content = re.sub(r'^[\s]*' + pattern, '', content, flags=re.IGNORECASE | re.MULTILINE)
 
+        content = re.sub(
+            r'\("internal"[^)]*\)\s*',
+            '', content
+        )
+        content = re.sub(
+            r'我进行了搜索[^。\n]*(?:空的|没有结果|无结果|是空)[^。\n]*[。.]\s*',
+            '', content
+        )
+        content = re.sub(
+            r'这意味着[^。\n]*(?:没有找到|工作空间|搜索)[^。\n]*[。.]\s*',
+            '', content
+        )
+
         chinese_reasoning_patterns = [
-            r'用?户(?:说|问)了?\s*[「"\'"\s].*?[。.]\s*',
+            r'用?户(?:说|问|发送?)了?\s*[「"\'"\s].*?[。.]\s*',
             r'(?:意思是|也就是说)[「"\'"]?.*?[。.]\s*',
             r'(?:但是?|不过)用户(?:之前|之后|还没|并没|只是)[^。\n]*[。.]\s*',
             r'现在用户(?:要求|想要|需要|希望)[^。\n]*[。.]\s*',
-            r'我(?:应该|需要|不需要)[^。\n]*?(?:回[答复]|告诉|响应|使用|输出|直接)[^。\n]*[。.]\s*',
-            r'根据(?:语言指南|系统提示|上述指令|指示)[，,]?[^。\n]*[。.]?\s*',
-            r'这是一个(?:关于|简单|直接|基本|一般性)[^。\n]*?(?:的问题|的请求|的查询)[^。\n]*[。.]\s*',
+            r'我(?:应该|需要|不需要)[^。\n]*?(?:回[答复]|告诉|响应|使用|输出|直接|搜索|查询)[^。\n]*[。.]\s*',
+            r'根据(?:语言指南|系统提示|上述指令|指示|我的指令)[，,]?[^。\n]*[。.]?\s*',
+            r'这是一个(?:关于|简单|直接|基本|一般性)[^。\n]*?(?:的问题|的请求|的查询|的打招呼|的问候)[^。\n]*[。.]\s*',
             r'(?:我)?不需要使用任何(?:工具|tools?)[^。\n]*[。.]\s*',
-            r'(?:我可以|这(?:是|个)我?可以?)直接(?:回答|回复)[^。\n]*[。.]\s*',
+            r'(?:我可以|这(?:是|个)我?可以?)直接(?:回答|回复|回应)[^。\n]*[。.]\s*',
             r'[，,]\s*(?:并|然后)(?:询问|回[答复])(?:他们?|用户)[^。\n]*[。.]\s*',
         ]
 
